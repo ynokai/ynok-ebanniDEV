@@ -1,0 +1,31 @@
+Corte de cabello: 30
+Arreglo de barba: 30
+Color: 30
+Corte y cover: 45
+Decoloración y corte: 120
+Tratamiento: 30
+Mechas: 30
+Peinado: 30
+Recogido: 60
+Depilación piernas enteras: 30
+Depilación axilas: 15
+Depilación ingles: 15
+Depilación ingles enteras: 20
+Depilación brazos: 15
+Depilación oídos: 10
+Depilación nasal: 10
+Depilación pómulos: 10
+Depilación mentón: 10
+Manicura normal: 30
+Manicura semi-permanente: 40
+Manicura permanente: 60
+Pedicura normal: 60
+Pedicura permanente: 90
+Limpieza cutis: 90
+Tratamientos estética: 60
+Masajes drenaje: 90
+Masaje general: 60
+Moldeador pestañas: 30
+Tinte cejas: 15
+Cejas y labio superior: 15
+Maquillaje: 50
