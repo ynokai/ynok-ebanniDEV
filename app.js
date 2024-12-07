@@ -355,6 +355,7 @@ Presentate como el recepcionista de Peluquerías Ébanni.
 Cuando un cliente te de las gracias, dile gracias a ti y el resto del mensaje.
 Si piden directamente cita con un peluquero, verifica primero el centro al que quieren acudir.
 Puedes hablar todos los idiomas, responde al cliente en el idioma en el que te hablan.
+Habla mas natural, como si fueras una persona.
 
 Los tratamientos capilares que ofrecemos son: anticaida, anticaspa, hidratante, nutritivo y más. Cuando un cliente quiera solicitar cualquier tratamiento capilar, procesalo como tratamiento.
 Si el cliente pide precios, comunicale que los precios no pueden ser hablados por telefono.
@@ -3502,27 +3503,51 @@ class CommandQueue {
   constructor() {
     this.queue = [];
     this.processing = false;
+    this.priorities = {
+      // Flujo principal de citas
+      'SERV': 1,        // Primera: identificar el servicio
+      'CENTROID': 2,    // Segunda: identificar el centro
+      'SPECIALITY': 3,  // Tercera: identificar tipo de servicio
+      'LISTAPELUQ': 4,  // Cuarta: buscar peluqueros
+      'GUARDACITA': 5,  // Quinta: guardar la cita
+      
+      // Funcionalidades adicionales
+      'CANCELACITA': 10,
+      'MODCITA': 11,
+      'CONSULTHOR': 12,
+      'BUSCARCITA': 13,
+      'SALON': 14,
+      'CENTROINFO': 15
+    };
   }
 
   addCommand(command) {
-    this.queue.push(command);
+    const priority = this.getCommandPriority(command);
+    this.queue.push({ command, priority });
+    this.queue.sort((a, b) => a.priority - b.priority);
+  }
+
+  getCommandPriority(command) {
+    for (const [cmd, priority] of Object.entries(this.priorities)) {
+      if (command.includes(cmd)) return priority;
+    }
+    return 999;
   }
 
   async processNextCommand(conversation) {
-    if (this.queue.length === 0 || this.processing) {
-      return "";
-    }
-
+    if (this.queue.length === 0 || this.processing) return "";
+    
     this.processing = true;
-    const command = this.queue.shift();
+    const { command } = this.queue.shift();
     console.log("command:", command);
     let rtn = "";
     
     try {
       let gpt = new Message(WhoEnum.ChatGPT);
+      console.log("gpt:", gpt);
       gpt.message = command;
       rtn = await conversation.ProcessOne(gpt);
-      console.log("rtn:", rtn);
+      
       if (rtn !== "") {
         await WhatsApp.Responder(_phone_number_id, conversation.from, rtn);
         conversation.CancelWatchDog();
@@ -3533,17 +3558,17 @@ class CommandQueue {
 
     this.processing = false;
 
-    // Si hay más comandos en la cola, procesar el siguiente
+    // Si hay más comandos, procesar el siguiente
     if (this.queue.length > 0) {
       return await this.processNextCommand(conversation);
     }
     
-    // Si no hay más comandos, solicitar una nueva respuesta a ChatGPT
+    // Si no hay más comandos, solicitar respuesta final a ChatGPT
     if (this.queue.length === 0) {
       conversation.GetFull();
       let msg = `${conversation.full}.\n Teniendo toda esta conversación, ¿qué le dirías al cliente? SOLO escribe el mensaje que debería llegarle al cliente.`;
       let response = await ChatGPT.SendToGPT(msg);
-      console.log("response:", response);
+      
       let responseMsg = new Message(WhoEnum.ChatGPT);
       responseMsg.message = response;
       conversation.AddMsg(responseMsg);
