@@ -365,7 +365,7 @@ Antes de confirmar la cita, pregunta por el nombre del cliente.
 Siempre tienen que decirte qué día quieren, no pueden dejarlo a tu elección, no pueden decirte el más cercano o el primero.
 Cuando el sistema te comunique los horarios disponibles, diselos al cliente con todas las opciones que te da.
 
-No pongas corchetes de estos "[]", solo los usa el sistema. Los mensajes entre <estos corchetes> debes ignorarlos. Máximo cada mensaje que hagas puede tener 599 caracteres. Si el sistema da un fallo, sigue las instrucciones del sistema.
+No pongas corchetes de estos "[]" ni de estos "<>", solo los usa el sistema. Los mensajes entre <estos corchetes> debes ignorarlos. Máximo cada mensaje que hagas puede tener 599 caracteres. Si el sistema da un fallo, sigue las instrucciones del sistema.
 Estos son los comandos que el sistema es capaz de procesar y deben ser utilizados para las siguientes funciones sin ser enviados al cliente:
 CENTROID: para identificar el centro en el que el cliente desea ser atendido.
 SPECIALITY: para indicar si es un servicio de "Señora", "Caballero" o "Estética".
@@ -987,6 +987,7 @@ class Conversation {
 
         // Incrementar interacciones (nueva conversación)
         statisticsManager.incrementInteractions();
+        
       } else {
         //si existe la obtiene del array
         rtn = conversaciones[from];
@@ -1219,32 +1220,59 @@ class Conversation {
     // Verificar si el último mensaje proviene del usuario
     if (this.lastMsg?.who == WhoEnum.User) {
       try {
+        
+         // Cargar el contexto de citas antes de procesar el mensaje
+        if (!this.citasContextLoaded) { // Flag para cargar solo una vez
+          await this.loadAppointmentsContext();
+          this.citasContextLoaded = true;
+        }
+        
         if (
           this.lastMsg.type == "button" &&
           this.lastMsg.message == "Cancelar cita"
         ) {
           this.lastMsg = null;
-
           let rtn = new Message(WhoEnum.System);
 
+          // Calcula las fechas relevantes: hoy y mañana
+          let today = moment().format("MM/DD/YYYY");
           let tomorrow = moment().add(1, "days").format("MM/DD/YYYY");
+
+          // Busca citas para hoy o mañana
           let appointments = await Appointments.find({
-            date: tomorrow,
+            date: { $in: [today, tomorrow] },
             clientPhone: this.from,
           });
 
           if (appointments.length == 0) {
-            rtn.message = "No tienes ninguna cita para mañana.";
+            rtn.message = "No tienes ninguna cita para hoy ni para mañana.";
           } else {
-            for (let appointment of appointments) {
-              await Appointments.deleteOne({ _id: appointment._id });
-            }
-            rtn.message =
-              "*Cita cancelada correctamente.* Gracias por cancerlarla. Puedes volver a escribirnos por aquí si quieres volver a pedir una cita o para cualquier cosa que necesites. Que tengas buen día.";
+            let details = appointments.map((appointment) =>
+              JSON.stringify(appointment, null, 2)
+            );
+
+            // Actualizar el status de todas las citas a "canceled"
+            await Appointments.updateMany(
+              {
+                date: { $in: [today, tomorrow] },
+                clientPhone: this.from,
+              },
+              { $set: { status: "canceled" } }
+            );
+
+            await statisticsManager.incrementCanceledAppointments(
+              appointments.length
+            );
+            console.log(
+              `${appointments.length} citas se han marcado como canceladas`
+            );
+
+            rtn.message = `*Cita(s) cancelada(s) correctamente.*\n\nDetalles de la(s) cita(s) cancelada(s):\n${details.join(
+              "\n\n"
+            )}\n\nGracias por cancelarla. Puedes volver a escribirnos por aquí si quieres volver a pedir una cita o para cualquier cosa que necesites. Que tengas buen día.`;
           }
 
           this.AddMsg(rtn);
-
           await WhatsApp.Responder(_phone_number_id, this.from, rtn.message);
           this.CancelResponder();
           this.CancelWatchDog();
@@ -1384,6 +1412,61 @@ class Conversation {
     }
     return rtn;
   }
+  
+  // Nuevo método específico para cargar el contexto de citas
+  async loadAppointmentsContext() {
+  try {
+    const today = moment().format("MM/DD/YYYY");
+    const tomorrow = moment().add(1, "days").format("MM/DD/YYYY");
+
+    const proximasCitas = await Appointments.find({
+      clientPhone: this.from,
+      date: { $in: [today, tomorrow] },
+      status: "confirmed"
+    });
+
+    //console.log(proximasCitas);
+    let rtn = new Message(WhoEnum.System);
+
+    if (proximasCitas && proximasCitas.length > 0) {
+      let citasInfo = proximasCitas.map(async (cita) => {
+        // Buscar información del centro y peluquero de forma segura
+        const centro = await Centers.findById(cita.centerInfo);
+        const peluquero = await Users.findById(cita.userInfo);
+        
+        const fecha = moment(cita.date, "MM/DD/YYYY").format("DD/MM/YYYY");
+        const servicios = cita.services?.map(s => s.serviceName).join(", ") || "No especificado";
+        const nombreCentro = centro?.centerName || "Centro no especificado";
+        const nombrePeluquero = peluquero?.name || "Peluquero no especificado";
+        
+        return `Fecha: ${fecha}
+          Hora: ${cita.initTime || "No especificada"}
+          Centro: ${nombreCentro}
+          Peluquero: ${nombrePeluquero}
+          Servicios: ${servicios}`;
+      });
+
+      // Esperar a que se resuelvan todas las promesas de búsqueda
+      const citasResueltas = await Promise.all(citasInfo);
+      
+      // Unir toda la información en un solo mensaje
+      rtn.message = `El cliente tiene las siguientes citas próximas:\n\n${citasResueltas.join("\n\n")}`;
+    } else {
+      rtn.message = "El cliente no tiene citas programadas para hoy ni mañana.";
+    }
+
+    this.AddMsg(rtn);
+  } catch (error) {
+    DoLog(`Error al buscar citas próximas: ${error}`, Log.Error);
+    await LogError(
+      this.from,
+      "Error al buscar citas próximas",
+      error,
+      this.salonID,
+      this.salonNombre
+    );
+  }
+}
 
   async ProcesarSolicitudDeServicio(gpt) {
     let msg = gpt.replace("SERV", "").replace("[", "").replace("]", "").trim();
@@ -1854,7 +1937,7 @@ class Conversation {
     let partes = gpt.split(" ");
     let fecha = partes[1];
 
-    let cancelacionExitosa = await MongoDB.BorrarCita(this.from, fecha);
+    let cancelacionExitosa = await MongoDB.BorrarCitas(this.from, fecha);
 
     let rtn = new Message(WhoEnum.System);
 
@@ -2604,34 +2687,35 @@ class MongoDB {
     return rtn;
   }
 
-  static async BorrarCita(from, fecha) {
+  static async BorrarCitas(from, fecha) {
     let rtn = false;
-    console.log("entra e borrarCita()");
+    console.log("entra en BorrarCitas()");
     try {
-      // Buscar una reserva que coincida con la fecha y el número de teléfono
-      let cita = await Appointments.findOne({
+      // Buscar todas las reservas que coincidan con la fecha y el número de teléfono
+      let citas = await Appointments.find({
         date: fecha,
         clientPhone: from,
       });
-      console.log("cita:", cita);
+      console.log("citas encontradas:", citas);
 
-      if (cita) {
-        // Actualizar el status de la cita a "canceled"
-            await Appointments.updateOne(
-                { _id: cita._id },
-                { $set: { status: "canceled" } }
-            );
+      if (citas.length > 0) {
+        // Actualizar el status de todas las citas a "canceled"
+        await Appointments.updateMany(
+          { date: fecha, clientPhone: from },
+          { $set: { status: "canceled" } }
+        );
         rtn = true;
-        console.log("cita se ha marcado como cancelada");
+        await statisticsManager.incrementCanceledAppointments(citas.length);
+        console.log(`${citas.length} citas se han marcado como canceladas`);
       } else {
         rtn = false;
-        console.log("cita no se ha borrado");
+        console.log("No se encontraron citas para cancelar");
       }
     } catch (ex) {
-      DoLog(`Error al borrar el evento en MongoDB:${ex}`, Log.Error);
+      DoLog(`Error al borrar las citas en MongoDB:${ex}`, Log.Error);
       await LogError(
-        this.from,
-        `Error al borrar la cita`,
+        from,
+        `Error al borrar las citas`,
         ex,
         this.salonID,
         this.salonNombre
@@ -2639,7 +2723,6 @@ class MongoDB {
       await statisticsManager.incrementFailedOperations();
       rtn = false;
     }
-    //console.log("rtn:", rtn);
     return rtn;
   }
 
@@ -3544,7 +3627,7 @@ class CommandQueue {
     
     try {
       let gpt = new Message(WhoEnum.ChatGPT);
-      console.log("gpt:", gpt);
+      //console.log("gpt:", gpt);
       gpt.message = command;
       rtn = await conversation.ProcessOne(gpt);
       
