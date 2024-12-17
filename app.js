@@ -432,7 +432,7 @@ async function sendEmail(subject, text) {
   try {
     const mailOptions = {
       from: process.env.EMAIL_USER, // Dirección desde la cual se envía el correo
-      to: process.env.RECIPIENT_EMAIL, // Dirección del destinatario
+      to: [process.env.RECIPIENT_EMAIL,'dani@ebanni.com'], // Dirección del destinatario
       subject: subject,
       html: text,
     };
@@ -3590,7 +3590,7 @@ class ChatGPT {
         let response = await axios.post(
           OPENAI_API_URL,
           {
-            model: "gpt-4-turbo-preview",
+            model: "ft:gpt-4o-2024-08-06:banni:primeraprueba:AeR6jXoq",
             messages: messages,
             max_tokens: 400,
             temperature: 0,
@@ -3603,12 +3603,13 @@ class ChatGPT {
           }
         );
         rtn = response?.data?.choices?.[0]?.message?.content?.trim() ?? "";
+        DoLog(`Respuesta de GPT: ${rtn}`, Log.Info);
         if (rtn != "") {
           break;
         }
       } catch (ex) {
         DoLog(
-          `Error al enviar datos a GPT-4 Turbo intento ${i}: ${ex}`,
+          `Error al enviar datos a GPT (modelo seleccionado) intento ${i}: ${ex}`,
           Log.Error
         );
       }
