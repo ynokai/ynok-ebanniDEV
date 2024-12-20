@@ -63,6 +63,11 @@ const GPTEnum = Object.freeze({
   CENTROINFO: "CENTROINFO",
 });
 
+// Guardar las funciones originales
+const originalLog = console.log;
+const originalError = console.error;
+
+
 // Definición de esquemas de Mongoose
 
 const servicesSchema = new mongoose.Schema({
@@ -202,6 +207,27 @@ const chatHistorySchema = new mongoose.Schema({
 });
 
 const ChatHistory = mongoose.model("ChatHistory", chatHistorySchema);
+
+const logsSchema = new mongoose.Schema({
+  _id: {
+    type: Schema.Types.ObjectId,
+    default: () => new mongoose.Types.ObjectId(),
+  },
+  from: { 
+    type: String, 
+    required: true, 
+    index: true  // Añadimos índice para mejor rendimiento
+  },
+  logs: [{
+    timestamp: { type: Date, default: Date.now },
+    type: { type: String, enum: ['log', 'error'], default: 'log' },
+    message: String
+  }],
+  startedAt: { type: Date, default: Date.now },
+  endedAt: { type: Date }
+});
+
+const Logs = mongoose.model("logs", logsSchema);
 
 // Función para conectar a la base de datos MongoDB
 async function connectDB() {
@@ -389,7 +415,7 @@ Tienes que averiguar que centro quiere el cliente, se lo tienes que preguntar, c
 El sistema tambien te dirá si debes preguntarle al cliente el tipo del servicio ("Señora", "Caballero" o "Estética"). Sólo puedes preguntarselo al cliente si el sistema te lo dice. Sólo si se lo has preguntado el cliente, en cuanto identifiques el tipo del servicio que desea hacerse el cliente tienes que escribir solo "SPECIALITY" y el tipo de servicio, que será "Señora", "Caballero" o "Estética".
 Si has identificado que el cliente desea saber el horario de un peluquero, primero pregunta de que salon es el peluquero. Una vez tengas ese dato, escribe "CONSULTHOR" seguido de la siguiente informacion: la fecha en formato ISO_8601 con zona horaria UTC, el nombre del peluquero (si no se especifica el peluquero, escribe MOREINFO). SOlo puede ser una fecha, no un rango.
 Si el cliente pide saber qué peluqueros hay disponibles, las horas disponibles de un peluquero en concreto, que le asignes uno aleatorio, o que le asignes un peluquero en concreto, asegúrate que hayan solicitado la hora deseada(sino, preestablecela a las 9h). Para saber la disponibilidad de peluqueros escribe SOLO "LISTAPELUQ" sin [] o ninguna informacion extra de la indicada, la fecha y hora en formato ISO con zona horaria de Madrid(Europa) y el nombre del peluquero que hayan solicitado (sino han solicitado ninguno escribe "MOREINFO") NADA MAS. LISTAPELUQ solo puede meter una fecha, no un rango de fechas. El sistema dirá la disponibilidad de los peluqueros.
-Si el sistema ha confirmado disponibilidad, pregunta al cliente si desea confirmar la cita y escribe "GUARDACITA" y todos los detalles de la cita en el formato siguiente (pon solo los valores, sin las etiquetas de los datos incluyendo "|"): | Servicio | Fecha y hora (en formato ISO con zona horaria de Madrid(Europa) | Salón | Peluquero | Nombre del cliente
+Si el sistema ha confirmado disponibilidad, pregunta al cliente si desea confirmar la cita y escribe "GUARDACITA" y todos los detalles de la cita en el formato siguiente (pon solo los valores, sin las etiquetas de los datos y incluyendo "|"). deberia verse asi: "GUARDACITA | Servicio | Fecha y hora (en formato ISO con zona horaria de Madrid(Europa) | Salón | Peluquero | Nombre del cliente"
 Si el cliente pide información sobre un centro (como el numero de telefono o la direccion), escribe "CENTROINFO" y el nombre del centro.
 
 Si has identificado que el cliente desea cancelar su cita, pregunta por la fecha de su cita. Una vez tengas ese dato, escribe "CANCELACITA” y la fecha en "MM/DD/YYYY" y tener en cuenta el mensaje que te llegue del sistema para informar al cliente. 
@@ -432,7 +458,7 @@ async function sendEmail(subject, text) {
   try {
     const mailOptions = {
       from: process.env.EMAIL_USER, // Dirección desde la cual se envía el correo
-      to: [process.env.RECIPIENT_EMAIL,'dani@ebanni.com'], // Dirección del destinatario
+      to: process.env.RECIPIENT_EMAIL, // Dirección del destinatario
       subject: subject,
       html: text,
     };
@@ -1055,9 +1081,11 @@ async function transcribirAudio(mediaId) {
 }
 
 // Función para registrar logs
-function DoLog(txt, type = Log.Log) {
-  let fecha = new Date().toISOString().replace(/T/, " ").replace(/\..+/, "");
-  let msg = `${fecha} - ${txt}`;
+async function DoLog(txt, type = Log.Log) {
+  // 1. Mantener el log en consola como está ahora
+  const fecha = new Date().toISOString().replace(/T/, " ").replace(/\..+/, "");
+  const msg = `${fecha} - ${txt}`;
+
   switch (type) {
     case Log.Log:
       console.log(msg);
@@ -1065,6 +1093,41 @@ function DoLog(txt, type = Log.Log) {
     case Log.Error:
       console.error(msg);
       break;
+  }
+
+  // 2. Guardar en MongoDB solo si hay una conversación activa
+  try {
+    // Obtener la conversación activa (la última del objeto conversaciones)
+    const activeConversation = Object.values(conversaciones).find(conv => conv.from);
+    
+    if (activeConversation?.from) {
+      // Buscar el log activo o crear uno nuevo
+      const logType = type === Log.Error ? 'error' : 'log';
+      const update = {
+        $push: {
+          logs: {
+            timestamp: new Date(),
+            type: logType,
+            message: msg
+          }
+        }
+      };
+
+      await Logs.findOneAndUpdate(
+        {
+          from: activeConversation.from,
+          endedAt: null // Solo actualizar logs activos
+        },
+        update,
+        {
+          upsert: true,
+          new: true,
+          setDefaultsOnInsert: true
+        }
+      );
+    }
+  } catch (error) {
+    console.error(`Error guardando log en MongoDB: ${error}`);
   }
 }
 
@@ -1142,6 +1205,87 @@ async function LogSuccess(phoneNumber, message, centerID, centerName) {
   }
 }
 
+// Función auxiliar para obtener la conversación activa
+function getActiveConversation() {
+  return Object.values(conversaciones).find(conv => conv.from);
+}
+
+// Sobreescribir console.log
+console.log = async function(...args) {
+  // Mantener el comportamiento original
+  originalLog.apply(console, args);
+
+  try {
+    const activeConversation = getActiveConversation();
+    if (activeConversation?.from) {
+      const msg = args.map(arg => 
+        typeof arg === 'object' ? JSON.stringify(arg) : arg
+      ).join(' ');
+
+      await Logs.findOneAndUpdate(
+        {
+          from: activeConversation.from,
+          endedAt: null
+        },
+        {
+          $push: {
+            logs: {
+              timestamp: new Date(),
+              type: 'log',
+              message: msg
+            }
+          }
+        },
+        {
+          upsert: true,
+          new: true,
+          setDefaultsOnInsert: true
+        }
+      );
+    }
+  } catch (error) {
+    originalError.call(console, 'Error guardando console.log en MongoDB:', error);
+  }
+};
+
+// Sobreescribir console.error
+console.error = async function(...args) {
+  // Mantener el comportamiento original
+  originalError.apply(console, args);
+
+  try {
+    const activeConversation = getActiveConversation();
+    if (activeConversation?.from) {
+      const msg = args.map(arg => 
+        typeof arg === 'object' ? JSON.stringify(arg) : arg
+      ).join(' ');
+
+      await Logs.findOneAndUpdate(
+        {
+          from: activeConversation.from,
+          endedAt: null
+        },
+        {
+          $push: {
+            logs: {
+              timestamp: new Date(),
+              type: 'error',
+              message: msg
+            }
+          }
+        },
+        {
+          upsert: true,
+          new: true,
+          setDefaultsOnInsert: true
+        }
+      );
+    }
+  } catch (error) {
+    originalError.call(console, 'Error guardando console.error en MongoDB:', error);
+  }
+};
+
 class Conversation {
   static GetConversation(req) {
     let rtn = null;
@@ -1199,6 +1343,8 @@ class Conversation {
     this.modificacionActiva = false; // Indica si estamos en el proceso de modificación
 
     this.commandQueue = new CommandQueue();
+    this.logId = new mongoose.Types.ObjectId();
+    this.initializeLog();
   }
 
   // inicia conversacion desde la request
@@ -1207,6 +1353,16 @@ class Conversation {
     let msg_obj = value?.messages?.[0] ?? null;
     _phone_number_id = value?.metadata?.phone_number_id ?? _phone_number_id;
     this.from = msg_obj?.from ?? "";
+
+    if (this.from) {
+      const newLog = new Logs({
+        _id: this.logId,
+        from: this.from,
+      });
+      newLog
+        .save()
+        .catch((err) => DoLog(`Error saving log: ${err}`, Log.Error));
+    }
   }
 
   Init(phone_number_id, from) {
@@ -1286,6 +1442,26 @@ class Conversation {
       DoLog(`Conversación con ${this.from} guardada en MongoDB correctamente`);
     } catch (err) {
       DoLog(`Error al guardar la conversación en MongoDB: ${err}`, Log.Error);
+    }
+    
+    // guardar Logs
+    try {
+      // Cerrar el log actual
+      await Logs.findByIdAndUpdate(
+        this.logId,
+        { 
+          endedAt: new Date(),
+          $push: {
+            logs: {
+              timestamp: new Date(),
+              type: 'log',
+              message: `Conversación finalizada después de ${this.messages.length} mensajes`
+            }
+          }
+        }
+      );
+    } catch (error) {
+      console.error(`Error cerrando log: ${error}`);
     }
 
     // Enviar encuesta y eliminar la conversación
@@ -1383,6 +1559,20 @@ class Conversation {
       this.from,
       "Lo siento, ha ocurrido un error con el último mensaje, por favor vuelve a enviarmelo."
     );
+  }
+  
+  async initializeLog() {
+    if (this.from) {
+      try {
+        const newLog = new Logs({
+          _id: this.logId,
+          from: this.from
+        });
+        await newLog.save();
+      } catch (error) {
+        console.error(`Error inicializando log: ${error}`);
+      }
+    }
   }
 
   async Process() {
@@ -1797,205 +1987,271 @@ class Conversation {
   }
 
   async ProcesarPeluquero(gpt) {
-    let rtn = new Message(WhoEnum.System);
-    //console.log("gpt:", gpt);
-    // Dividir gpt en fecha y nombre usando el último espacio como separador
-    let partes = gpt
-      .replace("LISTAPELUQ", "")
-      .trim()
-      .split(/\s+(?=[^\s]+$)/);
-    //console.log("partes:", partes);
-    let fecha = partes[0];
-    let nombre = partes[1] ? partes[1].trim() : ""; // Si hay nombre, lo tomamos; si no, es una cadena vacía
+  console.log("\n=== INICIO PROCESAR PELUQUERO ===");
+  let rtn = new Message(WhoEnum.System);
 
-    //console.log("Fecha:", fecha);
-    //console.log("this.nombreServicio:", this.nombreServicio);
+  try {
+    // 1. Extraer y validar los parámetros de entrada
+    const partes = gpt.replace("LISTAPELUQ", "").trim().split(/\s+(?=[^\s]+$)/);
+    const fechaStr = partes[0];
+    const nombrePeluquero = partes[1] ? partes[1].trim() : "MOREINFO";
+    
+    console.log("Parámetros recibidos:", {
+      fechaStr,
+      nombrePeluquero,
+      salonID: this.salonID,
+      nombreServicio: this.nombreServicio,
+      especialidadID: this.especialidadID,
+      duracionServicio: this.duracionServicio
+    });
 
-    //console.log(fecha);
-    if (moment(fecha, moment.ISO_8601, true).isValid()) {
-      DoLog(`FECHA: ${fecha}`, Log.Error);
+    // 2. Validar formato de fecha
+    if (!moment(fechaStr, moment.ISO_8601, true).isValid()) {
+      console.log("Error: Fecha inválida", fechaStr);
+      rtn.message = "La fecha proporcionada no es válida. Por favor, intenta de nuevo.";
+      this.AddMsg(rtn);
+      return "";
+    }
 
-      // Calculamos el peluquero por el nombre
-      let peluqueroID = await ChatGPT.CalculaPeluquero(nombre, this.salonID);
-      //console.log("peluqueroID:", peluqueroID);
+    // Debería ser
+    let fecha = moment.tz(fechaStr, "Europe/Madrid");
 
+    // 4. Validar horario comercial (10:00 - 22:00)
+    const hora = fecha.tz("Europe/Madrid").format("HH:mm");
+    const horarioApertura = moment(hora, "HH:mm").set({hour: 10, minute: 0});
+    const horarioCierre = moment(hora, "HH:mm").set({hour: 22, minute: 0});
+    
+    console.log("Validación de horario:", {
+      horasolicitada: hora,
+      apertura: horarioApertura.format("HH:mm"),
+      cierre: horarioCierre.format("HH:mm")
+    });
+    
+    if (moment(hora, "HH:mm").isBefore(horarioApertura) || 
+        moment(hora, "HH:mm").isAfter(horarioCierre)) {
+      console.log("Error: Hora fuera de horario comercial");
+      rtn.message = "Lo siento, ese horario está fuera de nuestro horario de atención (10:00 - 22:00).";
+      this.AddMsg(rtn);
+      return "";
+    }
+
+    // 5. Verificar prerrequisitos
+    console.log("Verificando prerrequisitos:", {
+      tieneSalon: !!this.salonID,
+      tieneServicio: !!this.nombreServicio,
+      tieneEspecialidad: !!this.especialidadID,
+      esSalonMixto: MongoDB.EsMixto(this.salonID)
+    });
+
+    if (!this.salonID) {
+      rtn.message = "¿Me podrías decir a qué salón te gustaría ir?";
+      this.AddMsg(rtn);
+      return "";
+    }
+
+    if (!this.nombreServicio) {
+      rtn.message = "¿Qué servicio te gustaría reservar?";
+      this.AddMsg(rtn);
+      return "";
+    }
+
+    if (!this.especialidadID && MongoDB.EsMixto(this.salonID)) {
+      rtn.message = "¿El servicio sería para señora o caballero?";
+      this.AddMsg(rtn);
+      return "";
+    }
+
+    // 6. Guardar información de la cita
+    this.fecha = fecha.utc().format("YYYY-MM-DD");
+    this.hora = fecha.tz("Europe/Madrid").format("HH:mm:ss");
+
+    console.log("Información de la cita:", {
+      fecha: this.fecha,
+      hora: this.hora,
+      duracionServicio: this.duracionServicio
+    });
+
+    // 7. Calcular hora de finalización del servicio
+    const horaFinServicio = moment(hora, "HH:mm")
+      .add(this.duracionServicio, "minutes")
+      .format("HH:mm");
+
+    console.log("Cálculo de finalización:", {
+      horaInicio: hora,
+      horaFin: horaFinServicio,
+      excederaCierre: moment(horaFinServicio, "HH:mm").isAfter(horarioCierre)
+    });
+
+    if (moment(horaFinServicio, "HH:mm").isAfter(horarioCierre)) {
+      rtn.message = `Lo siento, el servicio dura ${this.duracionServicio} minutos y excedería nuestro horario de cierre. ¿Te gustaría probar con un horario más temprano?`;
+      this.AddMsg(rtn);
+      return "";
+    }
+
+    // 8. Obtener peluqueros disponibles
+    console.log("\nConsultando disponibilidad de peluqueros...");
+    const peluquerosDisponibles = await MongoDB.ListarPeluquerosDisponibles(
+      fecha,
+      this.salonID,
+      this.nombreServicio,
+      this.especialidadID,
+      this.duracionServicio
+    );
+    console.log("Peluqueros disponibles:", peluquerosDisponibles);
+
+    // 9. Procesar según si se solicitó un peluquero específico o no
+    if (nombrePeluquero !== "MOREINFO") {
+      console.log("\nProcesando solicitud para peluquero específico:", nombrePeluquero);
+      
+      // Calcular el ID del peluquero usando ChatGPT.CalculaPeluquero antes de verificar disponibilidad
+      let peluqueroID = await ChatGPT.CalculaPeluquero(nombrePeluquero, this.salonID);
+
+      console.log("Resultado búsqueda peluquero:", {
+        nombreBuscado: nombrePeluquero,
+        peluqueroID: peluqueroID,
+        salonID: this.salonID
+      });
+
+      // Buscar el peluquero completo usando el ID
       for (let peluquero of peluqueros) {
         if (peluquero.peluqueroID == peluqueroID) {
           this.peluquero = peluquero;
-          //console.log("this.peluquero:", this.peluquero);
+          this.peluqueroNombre = peluquero.name;
           break;
-        } else {
-          this.peluquero = "";
         }
       }
-
-      //this.peluquero = "";
-      this.isRandom = false;
-      fecha = moment(fecha);
-
-      // ESTE IF ES POR EL CAMIO DE HORA DEL 27 DE OCTUBRE DE 2024
-      if (fecha.isAfter("2024-10-27")) {
-        fecha = fecha.utcOffset("+0200");
-        //        fecha = fecha.add(-1, "hours");
-      }
-      DoLog(`FECHA: ${fecha}`, Log.Error);
-
-      if (this.salonID == "") {
-        rtn.message = "Lo siento, falta conocer el salón.";
-      } else if (this.nombreServicio == "") {
-        rtn.message = "Lo siento, falta conocer el servicio.";
-      } else if (this.especialidadID == "" && MongoDB.EsMixto(this.salonID)) {
-        rtn.message = "Lo siento, falta conocer el tipo de servicio.";
+      
+      if (!this.peluquero) {
+        console.log("Peluquero no encontrado:", nombrePeluquero);
+        rtn.message = `No encontré al peluquero "${nombrePeluquero}". ¿Podrías confirmar el nombre?`;
+      } else if (peluquerosDisponibles.includes(this.peluquero.peluqueroID)) {
+        console.log("Peluquero disponible:", {
+          nombre: this.peluqueroNombre,
+          id: this.peluquero.peluqueroID
+        });
+        rtn.message = `¡Perfecto! ${this.peluqueroNombre} está disponible para el ${moment(this.fecha).format("DD/MM/YYYY")} a las ${this.hora}. ¿Quieres confirmar la cita?`;
       } else {
-        this.fecha = fecha.utc().format("YYYY-MM-DD");
-        this.hora = fecha.tz("Europe/Madrid").format("HH:mm:ss");
-        /*console.log(
-          "SERGIO: Obtener la lista de peluqueros disponibles a la hora solicitada:",
+        console.log("Buscando horarios alternativos para el peluquero...");
+        const horariosAlternativos = await MongoDB.BuscarHorariosDisponiblesPeluquero(
+          this.peluquero.peluqueroID,
           fecha,
-          this.salonID,
-          this.nombreServicio,
-          this.especialidadID,
-          this.duracionServicio
-        );*/
+          this.duracionServicio,
+          this.salonID
+        );
+        console.log("Horarios alternativos encontrados:", horariosAlternativos);
 
-        // Obtener la lista de peluqueros disponibles a la hora solicitada
-        let peluquerosDisponibles = await MongoDB.ListarPeluquerosDisponibles(
-          fecha,
+        if (horariosAlternativos.length > 0) {
+          rtn.message = `${this.peluqueroNombre} no está disponible a las ${this.hora}, pero tiene estos horarios:\n${horariosAlternativos.map(h => `• ${h}`).join("\n")}\n\n¿Te interesa alguno?`;
+        } else {
+          console.log("Buscando disponibilidad en próximos días...");
+          const diasDisponibles = await MongoDB.BuscarDisponibilidadSiguienteSemana(
+            this.peluquero.peluqueroID,
+            this.salonID,
+            this.nombreServicio,
+            this.especialidadID,
+            this.duracionServicio,
+            fecha
+          );
+          console.log("Días disponibles encontrados:", diasDisponibles);
+
+          if (diasDisponibles.length > 0) {
+            rtn.message = `${this.peluqueroNombre} no tiene disponibilidad el ${moment(this.fecha).format("DD/MM/YYYY")}, pero te puedo ofrecer:\n\n${
+              diasDisponibles.map(dia => `*${dia.dia}*: ${dia.horarios.join(", ")}`).join("\n")
+            }\n\n¿Alguno de estos horarios te vendría bien?`;
+          } else {
+            rtn.message = `${this.peluqueroNombre} no tiene disponibilidad en los próximos días. ¿Prefieres que miremos con otro peluquero o probamos otra fecha?`;
+          }
+        }
+      }
+    } else {
+      console.log("\nProcesando solicitud sin peluquero específico");
+      if (peluquerosDisponibles.length > 0) {
+        const nombresPeluqueros = await MongoDB.ObtenerNombresPeluquerosPorIDs(peluquerosDisponibles);
+        console.log("Nombres de peluqueros disponibles:", nombresPeluqueros);
+        rtn.message = `Para el ${moment(this.fecha).format("DD/MM/YYYY")} a las ${this.hora} tengo disponibles a: ${nombresPeluqueros.join(", ")}. ¿Con quién prefieres la cita?`;
+      } else {
+        console.log("Buscando horarios alternativos con cualquier peluquero...");
+        const horariosConPeluqueros = await MongoDB.BuscarHorariosConPeluquerosDisponibles(
+          this.fecha,
           this.salonID,
           this.nombreServicio,
           this.especialidadID,
           this.duracionServicio
         );
+        console.log("Horarios alternativos encontrados:", horariosConPeluqueros);
 
-        console.log("LN 1210 peluquerosDisponibles:", peluquerosDisponibles);
-
-        //console.log("this.peluqueroNombre:", this.peluqueroNombre);
-        if (this.peluquero != "") {
-          //console.log("entra en condicion del peluquero identificado");
-          //console.log("this.peluquero:", this.peluquero);
-          // Si el cliente pidió un peluquero específico
-          if (peluquerosDisponibles.includes(this.peluquero.peluqueroID)) {
-            // El peluquero está disponible
-
-            rtn.message = `El peluquero ${this.peluqueroNombre} está disponible para el ${this.fecha} a las ${this.hora}. ¿Quieres confirmar la cita?`;
-          } else {
-            //console.log("entra en else de peluquero especifico con horarios alternativos");
-            // El peluquero no está disponible, ofrecer horarios alternativos
-            let horariosDisponibles =
-              await MongoDB.BuscarHorariosDisponiblesPeluquero(
-                this.peluquero.peluqueroID,
-                fecha,
-                this.duracionServicio, // Se considera la duración del servicio
-                this.salonID
-              );
-
-            console.log("horariosDisponibles:", horariosDisponibles);
-            if (horariosDisponibles.length > 0) {
-              rtn.message = `Lo siento, el peluquero ${
-                this.peluqueroNombre
-              } no está disponible a las ${
-                this.hora
-              }. Sin embargo, está disponible a las siguientes horas: ${horariosDisponibles.join(
-                ", "
-              )}. ¿Te gustaría elegir alguna de estas horas?`;
-              //console.log(rtn.message);
-            } else {
-              // Nueva funcionalidad: buscar en los próximos 7 días
-              const diasDisponibles =
-                await MongoDB.BuscarDisponibilidadSiguienteSemana(
-                  this.peluquero.peluqueroID,
-                  this.salonID,
-                  this.nombreServicio,
-                  this.especialidadID,
-                  this.duracionServicio,
-                  fecha // Fecha solicitada por el cliente
-                );
-
-              if (diasDisponibles.length > 0) {
-                rtn.message = `Lo siento, el peluquero ${
-                  this.peluqueroNombre
-                } no está disponible en todo el día ${
-                  this.fecha
-                }. Sin embargo, tiene disponibilidad los siguientes días:\n\n${diasDisponibles
-                  .map((dia) => `*${dia.dia}*: ${dia.horarios.join(", ")}`)
-                  .join("\n")}\n\n¿Te gustaría elegir alguno de estos días?`;
-              } else {
-                rtn.message = `Lo siento, el peluquero ${this.peluqueroNombre} no tiene disponibilidad en todo el día ${this.fecha} ni en los próximos 7 días. ¿Te gustaría intentar con otro peluquero o elegir otro día?`;
-              }
-            }
-          }
-          //establecer nombre del peluquero
-          //this.peluqueroNombre = this.peluquero.name;
+        if (horariosConPeluqueros.length > 0) {
+          rtn.message = `Para esa hora exacta no tengo disponibilidad, pero tengo estos horarios:\n\n${
+            horariosConPeluqueros.map(h => `• ${h.hora}: ${h.peluqueroNombre}`).join("\n")
+          }\n\n¿Te interesa alguno?`;
         } else {
-          // Si el cliente no eligió un peluquero específico, mostrar todos los disponibles a la hora solicitada
-          if (peluquerosDisponibles.length > 0) {
-            let nombresPeluqueros =
-              await MongoDB.ObtenerNombresPeluquerosPorIDs(
-                peluquerosDisponibles
-              );
-            rtn.message = `Estos son los peluqueros disponibles para el ${
-              this.fecha
-            } a las ${this.hora}: ${nombresPeluqueros.join(
-              ", "
-            )}. ¿Te gustaría elegir alguno o que se te asigne uno aleatoriamente?`;
-            //console.log(rtn.message);
-          } else {
-            // Si no hay peluqueros disponibles a la hora solicitada, buscar otras horas disponibles con cualquier peluquero
-            let horariosPeluquerosDisponibles =
-              await MongoDB.BuscarHorariosConPeluquerosDisponibles(
-                this.fecha,
-                this.salonID,
-                this.nombreServicio,
-                this.especialidadID,
-                this.duracionServicio // Se considera la duración del servicio
-              );
-
-            console.log(
-              "horariosPeluquerosDisponibles:",
-              horariosPeluquerosDisponibles
-            );
-            if (horariosPeluquerosDisponibles.length > 0) {
-              rtn.message = `Lo siento, no hay peluqueros disponibles a las ${
-                this.hora
-              }. Sin embargo, estos son los horarios disponibles con otros peluqueros:\n\n${horariosPeluquerosDisponibles
-                .map(
-                  (horario) =>
-                    `*${horario.hora}* - Peluquero: ${horario.peluqueroNombre}`
-                )
-                .join("\n")}. ¿Te gustaría elegir alguna de estas horas?`;
-              //console.log(rtn.message);
-            } else {
-              rtn.message = `Lo siento, no hay peluqueros disponibles en todo el día ${this.fecha}. ¿Te gustaría intentar con otro día?`;
-              //console.log(rtn.message);
-            }
-          }
+          rtn.message = `Lo siento, no hay disponibilidad para el ${moment(this.fecha).format("DD/MM/YYYY")}. ¿Te gustaría probar otro día?`;
         }
       }
-    } else {
-      rtn.message = "Lo siento, la fecha y hora de la cita es incorrecta.";
-      await statisticsManager.incrementFailedOperations();
-      await LogError(
-        this.from,
-        `Error al procesar Peluquero`,
-        rtn.message,
-        this.salonID,
-        this.salonNombre
-      );
     }
 
+    // 10. Registrar el mensaje en el sistema
+    console.log("\nMensaje final:", rtn.message);
     DoLog(rtn.message);
     this.AddMsg(rtn);
+    console.log("=== FIN PROCESAR PELUQUERO ===\n");
+    return "";
+
+  } catch (error) {
+    // 11. Manejo de errores
+    console.error("\n=== ERROR EN PROCESAR PELUQUERO ===");
+    console.error("Detalles del error:", {
+      mensaje: error.message,
+      stack: error.stack,
+      datos: {
+        fecha: this.fecha,
+        hora: this.hora,
+        salon: this.salonID,
+        servicio: this.nombreServicio
+      }
+    });
+    
+    const errorMsg = `Error al procesar la disponibilidad: ${error.message}`;
+    DoLog(errorMsg, Log.Error);
+    await LogError(
+      this.from,
+      errorMsg,
+      error,
+      this.salonID,
+      this.salonNombre
+    );
+    await statisticsManager.incrementFailedOperations();
+    
+    rtn.message = "Lo siento, ha ocurrido un error al verificar la disponibilidad. ¿Podrías intentarlo de nuevo?";
+    this.AddMsg(rtn);
+    console.log("=== FIN ERROR PROCESAR PELUQUERO ===\n");
     return "";
   }
+}
 
   async ProcesarCita(gpt) {
+    DoLog(`Iniciando ProcesarCita con input: ${gpt}`);
+    
     // Dividir el comando en partes para extraer los datos de la cita
     let partesCita = gpt.split("|");
+    DoLog(`Partes de la cita extraídas: ${JSON.stringify(partesCita)}`);
+    
     this.nombreServicio = partesCita[1].trim();
     let fechaHora = partesCita[2].trim();
     this.salonNombre = partesCita[3].trim();
     this.peluqueroNombre = partesCita[4].trim();
-    this.nombre = partesCita[5].trim();
+    this.nombre = partesCita[5]
+      .trim()
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+
+    DoLog(`Datos procesados:
+    - Servicio: ${this.nombreServicio}
+    - Fecha/Hora: ${fechaHora}
+    - Salón: ${this.salonNombre}
+    - Peluquero: ${this.peluqueroNombre}
+    - Cliente: ${this.nombre}`);
 
     let rtn = new Message(WhoEnum.System);
     let falta = [];
@@ -2003,16 +2259,22 @@ class Conversation {
     let fechaFin = null;
     this.peluquero = "";
 
-    // Validación de los datos requeridos
+    // Validación del servicio
+    DoLog(`Iniciando validación del servicio: ${this.nombreServicio}`);
     if (this.nombreServicio == "") {
       falta.push("Servicio");
+      DoLog("Error: Servicio vacío");
     } else {
       this.servicioID = await ChatGPT.CalculaServicioID(this.nombreServicio);
+      DoLog(`ServicioID calculado: ${this.servicioID}`);
       if (this.servicioID == "") {
         falta.push("Servicio");
+        DoLog("Error: No se pudo calcular el ServicioID");
       }
     }
 
+    // Procesamiento de fecha y hora
+    DoLog("Iniciando procesamiento de fecha y hora");
     let timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const moment = require("moment-timezone");
     let citaInicioConZona = moment.tz(fechaHora, "Europe/Madrid").format();
@@ -2020,63 +2282,84 @@ class Conversation {
       .tz(citaInicioConZona, "Europe/Madrid")
       .add(this.duracionServicio, "minutes")
       .format();
+    
+    DoLog(`Fecha/hora procesada:
+    - Timezone: ${timezone}
+    - Inicio: ${citaInicioConZona}
+    - Fin: ${fechaHoraFin}
+    - Duración: ${this.duracionServicio} minutos`);
 
+    // Validación del salón
+    DoLog(`Iniciando validación del salón. SalonID actual: ${this.salonID}`);
     if (this.salonID == "") {
       falta.push("Salón");
+      DoLog("Error: SalonID vacío");
     } else {
       let salon = await MongoDB.ObtenerSalonPorSalonID(this.salonID);
+      DoLog(`Datos del salón obtenidos: ${JSON.stringify(salon)}`);
       this.salonID = salon.salonID;
       this.salonNombre = salon.nombre;
     }
 
+    // Validación del peluquero
+    DoLog(`Iniciando validación del peluquero: ${this.peluqueroNombre}`);
     if (this.peluqueroNombre == "") {
       falta.push("Peluquero");
+      DoLog("Error: Nombre de peluquero vacío");
     } else {
       let peluqueroID = await ChatGPT.CalculaPeluquero(
         this.peluqueroNombre,
         this.salonID
       );
+      DoLog(`PeluqueroID calculado: ${peluqueroID}`);
 
       for (let peluquero of peluqueros) {
+        DoLog(`Comparando con peluquero: ${peluquero.peluqueroID}`);
         if (peluquero.peluqueroID == peluqueroID) {
           this.peluquero = peluquero;
+          DoLog(`Peluquero encontrado: ${JSON.stringify(peluquero)}`);
           break;
-        } else {
-          this.peluquero = "";
         }
       }
       if (this.peluquero == "") {
         falta.push("Peluquero");
+        DoLog("Error: No se encontró el peluquero en la lista");
       }
     }
 
+    // Validación del nombre del cliente
+    DoLog(`Validando nombre del cliente: ${this.nombre}`);
     if (this.nombre == "") {
       falta.push("Nombre cliente");
+      DoLog("Error: Nombre de cliente vacío");
     }
 
-    // Enviar mensaje de error si faltan datos
+    // Manejo de errores en la validación
     if (falta.length > 0) {
-      rtn.message = `Lo siento no puedo hacer la reserva de la cita porque me faltan estos datos: ${falta.join(
-        ", "
-      )}. Pidele estos datos al cliente.`;
-      DoLog(rtn.message);
+      DoLog(`Validación fallida. Faltan los siguientes campos: ${falta.join(", ")}`);
+      rtn.message = `Para completar tu reserva, necesitaría que me digas ${falta.join(" y ")}. ¿Me ayudas con esa información?`;
       this.AddMsg(rtn);
       return "";
     }
 
-    // Guardar la nueva cita en la base de datos
+    // Guardado de la cita
+    DoLog("Iniciando guardado de la cita en la base de datos");
+    this.citaGuardada = false;  // Inicializamos como false por defecto
     let saved = await MongoDB.GuardarEventoEnBD(
       this,
       citaInicioConZona,
       fechaHoraFin
     );
+    
     try {
-      if (saved) {
+      if (saved === true) {  // Comparación estricta con true
+        DoLog("Cita guardada exitosamente");
         rtn.message = `Comando GUARDACITA confirmado. La cita del cliente ha sido guardada en el sistema.`;
         this.citaGuardada = true;
 
-        // Incrementar el contador de citas confirmadas y registrar éxito
         await statisticsManager.incrementConfirmedAppointments();
+        DoLog("Contador de citas confirmadas incrementado");
+        
         await LogSuccess(
           this.from,
           "Cita guardada con éxito",
@@ -2084,22 +2367,23 @@ class Conversation {
           this.salonNombre
         );
 
-        // Si estamos en modo de modificación y se guardó la nueva cita, elimina la antigua
-        //console.log("this.citaAntigua:", this.citaAntigua);
+        // Manejo de modificación de cita
         if (this.modificacionActiva && this.citaAntigua) {
+          DoLog(`Procesando modificación de cita antigua: ${JSON.stringify(this.citaAntigua)}`);
           await Appointments.updateOne(
-            { _id: this.citaAntigua._id }, // Identifica la cita antigua por ID
-            { $set: { status: "canceled" } } // Cambia el estado a 'canceled'
+            { _id: this.citaAntigua._id },
+            { $set: { status: "canceled" } }
           );
+          DoLog("Cita antigua marcada como cancelada");
           rtn.message += "La cita anterior ha sido marcada como cancelada.";
           this.modificacionActiva = false;
           this.citaAntigua = null;
-          // Incrementa el contador de citas modificadas
           await statisticsManager.incrementModifiedAppointments();
+          DoLog("Contador de citas modificadas incrementado");
         }
       } else {
-        // Error en el guardado de la cita
-        rtn.message = `Lo siento no puedo hacer la reserva de la cita porque hubo un error en el sistema, intenta más tarde o contacta con el salón.`;
+        DoLog("Error: No se pudo guardar la cita");
+        rtn.message = `Ha habido un pequeño problema técnico 😅 ¿Podrías intentarlo de nuevo en unos minutos? Si el problema persiste, puedes llamar directamente al salón.`;
         await statisticsManager.incrementFailedOperations();
         await LogError(
           this.from,
@@ -2110,7 +2394,8 @@ class Conversation {
         );
       }
     } catch (ex) {
-      // Log de error con el mensaje y el stack trace del error
+      DoLog(`Error crítico durante el procesamiento: ${ex.message}`);
+      DoLog(`Stack trace: ${ex.stack}`);
       await LogError(
         this.from,
         `Error al procesar la cita`,
@@ -2120,10 +2405,10 @@ class Conversation {
       );
     }
 
-    DoLog(rtn.message);
+    DoLog(`Finalizando ProcesarCita. Mensaje final: ${rtn.message}`);
     this.AddMsg(rtn);
     return "";
-  }
+}
 
   async ProcesarCancelacionCita(gpt) {
     let partes = gpt.split(" ");
@@ -3590,7 +3875,7 @@ class ChatGPT {
         let response = await axios.post(
           OPENAI_API_URL,
           {
-            model: "ft:gpt-4o-2024-08-06:banni:primeraprueba:AeR6jXoq",
+            model: "gpt-4-turbo-preview",
             messages: messages,
             max_tokens: 400,
             temperature: 0,
@@ -3603,13 +3888,12 @@ class ChatGPT {
           }
         );
         rtn = response?.data?.choices?.[0]?.message?.content?.trim() ?? "";
-        DoLog(`Respuesta de GPT: ${rtn}`, Log.Info);
         if (rtn != "") {
           break;
         }
       } catch (ex) {
         DoLog(
-          `Error al enviar datos a GPT (modelo seleccionado) intento ${i}: ${ex}`,
+          `Error al enviar datos a GPT-4 Turbo intento ${i}: ${ex}`,
           Log.Error
         );
       }
